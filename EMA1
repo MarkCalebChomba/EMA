@@ -16,8 +16,8 @@ logger = logging.getLogger("okx_ema_bot")
 class Config:
     # Trading parameters
     SYMBOL = "DOGE/USDT:USDT"  # Trading pair
-    TIMEFRAME = "15m"  # Timeframe for chart data
-    CONTRACT_SIZE = 0.03  # Trade size
+    TIMEFRAME = "1m"  # Timeframe for chart data
+    CONTRACT_SIZE = 0.01  # Trade size
     LEVERAGE = 50  # Leverage
 
     # EMA parameters
@@ -45,14 +45,14 @@ class OKXEMABot:
         self.positions = []  # List of open positions
         self.running = False
         self.order_history = []
-        self.last_signal = None #track the last signal
+        self.current_signal = None  # Track the current signal
 
     def initialize_exchange(self):
         """Initialize the OKX exchange connection"""
         try:
             self.exchange = ccxt.okx({
                 'apiKey': self.config.API_KEY,
-                'secret': self.config.SECRET_KEY,
+                'secret': self.config.SECRET_KEY,  # Corrected key name
                 'password': self.config.PASSPHRASE,
                 'enableRateLimit': True,
                 'options': {
@@ -66,7 +66,7 @@ class OKXEMABot:
             logger.error(f"Network error connecting to OKX: {e}")
             raise
         except ccxt.ExchangeError as e:
-            logger.error(f"Exchange error connecting to OKX: e")
+            logger.error(f"Exchange error connecting to OKX: {e}")
             raise
         except Exception as e:
             logger.error(f"Failed to initialize exchange: {e}")
@@ -138,9 +138,7 @@ class OKXEMABot:
 
     def check_exit_signal(self, df, position_type):
         """Check for exit signals based on 10 EMA crossing 30 EMA"""
-        ema_exit_prev = df[f'ema_{self.config.EMA_EXIT}'].iloc[-2]
         ema_exit_curr = df[f'ema_{self.config.EMA_EXIT}'].iloc[-1]
-        ema_short_prev = df[f'ema_{self.config.EMA_SHORT}'].iloc[-2]
         ema_short_curr = df[f'ema_{self.config.EMA_SHORT}'].iloc[-1]
 
         if position_type == "long" and ema_exit_curr < ema_short_curr:
@@ -308,29 +306,23 @@ class OKXEMABot:
                 for position in positions_to_close:
                     self.close_position(position)
 
-                # Check for entry signals only if not already in a trade
-                if not self.positions:
-                    trend = self.check_directional_bias(df)
-                    signal = self.check_entry_signal(df)
-                    if signal:
-                        logger.info(f"Entry signal {signal} detected, trend is {trend}")
-                        order = self.execute_trade(signal, current_price)
-                        if order is None:
-                            logger.error(f"Failed to execute {signal} trade")
-                        else:
-                            logger.info(f"{signal.upper()} order executed")
-                        self.last_signal = signal #update last signal
-                elif self.positions: #check to enter again
-                    trend = self.check_directional_bias(df)
-                    signal = self.check_entry_signal(df)
-                    if signal and signal != self.last_signal:
-                        logger.info(f"Entry signal {signal} detected, trend is {trend}")
-                        order = self.execute_trade(signal, current_price)
-                        if order is None:
-                            logger.error(f"Failed to execute {signal} trade")
-                        else:
-                            logger.info(f"{signal.upper()} order executed")
-                        self.last_signal = signal
+                # Check for entry signals
+                trend = self.check_directional_bias(df)
+                signal = self.check_entry_signal(df)
+
+                if signal:
+                    if self.current_signal and signal != self.current_signal:
+                        logger.info(f"Signal change detected from {self.current_signal} to {signal}, closing existing positions.")
+                        for position in list(self.positions):
+                            self.close_position(position)  # Close all positions
+                        self.positions = []  # Clear the positions list after closing
+                    order = self.execute_trade(signal, current_price)
+                    if order is None:
+                        logger.error(f"Failed to execute {signal} trade")
+                    else:
+                        logger.info(f"{signal.upper()} order executed")
+                    self.current_signal = signal  # Update current signal
+
                 time.sleep(self.config.CHECK_INTERVAL)
 
             except Exception as e:
