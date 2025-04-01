@@ -1,0 +1,390 @@
+import time
+import pandas as pd
+import ccxt
+import logging
+from datetime import datetime
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("okx_ema_bot")
+
+# Configuration
+class Config:
+    # Trading parameters
+    SYMBOL = "DOGE/USDT:USDT"  # Trading pair
+    TIMEFRAME = "15m"  # Timeframe for chart data
+    CONTRACT_SIZE = 0.03  # Trade size
+    LEVERAGE = 50  # Leverage
+
+    # EMA parameters
+    EMA_LONG = 200
+    EMA_MID = 60
+    EMA_SHORT = 30
+    EMA_EXIT = 10
+
+    # Risk management
+    STOP_LOSS_PERCENT = 1.0
+    TAKE_PROFIT_PERCENT = 2.0
+
+    # Signal check frequency
+    CHECK_INTERVAL = 60  # Check every 60 seconds
+
+    # API credentials
+    API_KEY = "804e0f50-3db2-4d8e-b542-258566a06fd4"
+    SECRET_KEY = "375333D24C6F54C0D3FE13FFD5F4DE8A"
+    PASSPHRASE = "#Dinywa15"
+
+class OKXEMABot:
+    def __init__(self, config):
+        self.config = config
+        self.exchange = None
+        self.positions = []  # List of open positions
+        self.running = False
+        self.order_history = []
+        self.last_signal = None #track the last signal
+
+    def initialize_exchange(self):
+        """Initialize the OKX exchange connection"""
+        try:
+            self.exchange = ccxt.okx({
+                'apiKey': self.config.API_KEY,
+                'secret': self.config.SECRET_KEY,
+                'password': self.config.PASSPHRASE,
+                'enableRateLimit': True,
+                'options': {
+                    'defaultType': 'swap',
+                }
+            })
+            if self.exchange is None:
+                raise Exception("Failed to initialize exchange object.")
+            logger.info("Exchange connection initialized successfully")
+        except ccxt.NetworkError as e:
+            logger.error(f"Network error connecting to OKX: {e}")
+            raise
+        except ccxt.ExchangeError as e:
+            logger.error(f"Exchange error connecting to OKX: e")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to initialize exchange: {e}")
+            raise
+
+    def set_leverage(self):
+        """Set the leverage for the trading pair"""
+        try:
+            if self.exchange is not None:
+                try:
+                    self.exchange.set_leverage(self.config.LEVERAGE, self.config.SYMBOL)
+                    logger.info(f"Leverage set to {self.config.LEVERAGE}x for {self.config.SYMBOL}")
+                except Exception as e:
+                    logger.error(f"Failed to set leverage: {e}")
+                    # Continue without raising. Bot can still run, but leverage might be wrong.
+            else:
+                raise Exception("Exchange not initialized.")
+        except ccxt.NetworkError as e:
+            logger.error(f"Network error setting leverage: {e}")
+            raise
+        except ccxt.ExchangeError as e:
+            logger.error(f"Exchange error setting leverage: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to set leverage: {e}")
+            raise
+
+    def fetch_ohlcv_data(self):
+        """Fetch OHLCV data from the exchange"""
+        try:
+            if self.exchange is not None:
+                ohlcv = self.exchange.fetch_ohlcv(
+                    symbol=self.config.SYMBOL,
+                    timeframe=self.config.TIMEFRAME,
+                    limit=max(self.config.EMA_LONG, 100) + 50  # Fetch enough data
+                )
+            else:
+                raise Exception("Exchange not initialized.")
+
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+
+            df[f'ema_{self.config.EMA_LONG}'] = df['close'].ewm(span=self.config.EMA_LONG, adjust=False).mean()
+            df[f'ema_{self.config.EMA_MID}'] = df['close'].ewm(span=self.config.EMA_MID, adjust=False).mean()
+            df[f'ema_{self.config.EMA_SHORT}'] = df['close'].ewm(span=self.config.EMA_SHORT, adjust=False).mean()
+            df[f'ema_{self.config.EMA_EXIT}'] = df['close'].ewm(span=self.config.EMA_EXIT, adjust=False).mean()
+            return df
+        except ccxt.NetworkError as e:
+            logger.error(f"Network error fetching OHLCV data: {e}")
+            return None
+        except ccxt.ExchangeError as e:
+            logger.error(f"Exchange error fetching OHLCV data: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to fetch OHLCV data: {e}")
+            return None
+
+    def check_entry_signal(self, df):
+        """Check for entry signals based on 30 EMA crossing 60 EMA"""
+        ema_short_curr = df[f'ema_{self.config.EMA_SHORT}'].iloc[-1]
+        ema_mid_curr = df[f'ema_{self.config.EMA_MID}'].iloc[-1]
+
+        if ema_short_curr > ema_mid_curr:
+            return "buy"
+        elif ema_short_curr < ema_mid_curr:
+            return "sell"
+        return None
+
+    def check_exit_signal(self, df, position_type):
+        """Check for exit signals based on 10 EMA crossing 30 EMA"""
+        ema_exit_prev = df[f'ema_{self.config.EMA_EXIT}'].iloc[-2]
+        ema_exit_curr = df[f'ema_{self.config.EMA_EXIT}'].iloc[-1]
+        ema_short_prev = df[f'ema_{self.config.EMA_SHORT}'].iloc[-2]
+        ema_short_curr = df[f'ema_{self.config.EMA_SHORT}'].iloc[-1]
+
+        if position_type == "long" and ema_exit_curr < ema_short_curr:
+            return True
+        elif position_type == "short" and ema_exit_curr > ema_short_curr:
+            return True
+        return False
+
+    def check_directional_bias(self, df):
+        """Check if price is above or below 200 EMA to determine trend direction"""
+        current_price = df['close'].iloc[-1]
+        ema_200 = df[f'ema_{self.config.EMA_LONG}'].iloc[-1]
+
+        if current_price > ema_200:
+            return "bullish"
+        else:
+            return "bearish"
+
+    def execute_trade(self, trade_type, price):
+        """Execute a trade on the exchange"""
+        try:
+            if self.exchange is not None:
+                amount = self.config.CONTRACT_SIZE
+                params = {'tdMode': 'cross'}
+                order = None
+
+                if trade_type == "buy":
+                    order = self.exchange.create_market_buy_order(
+                        symbol=self.config.SYMBOL, amount=amount, params={**params, 'posSide': 'long'}
+                    )
+                    position = {'type': 'long', 'price': price, 'amount': amount,
+                                'timestamp': datetime.now(),
+                                'stop_loss': price * (1 - self.config.STOP_LOSS_PERCENT / 100),
+                                'take_profit': price * (1 + self.config.TAKE_PROFIT_PERCENT / 100)}
+                    self.positions.append(position)
+                    self.order_history.append({'type': 'buy', 'price': price, 'amount': amount, 'timestamp': datetime.now()})
+                    logger.info(f"BUY order executed: Size={amount} contracts at market price {price}")
+                    return order
+
+                elif trade_type == "sell":
+                    order = self.exchange.create_market_sell_order(
+                        symbol=self.config.SYMBOL, amount=amount, params={**params, 'posSide': 'short'}
+                    )
+                    position = {'type': 'short', 'price': price, 'amount': amount,
+                                'timestamp': datetime.now(),
+                                'stop_loss': price * (1 + self.config.STOP_LOSS_PERCENT / 100),
+                                'take_profit': price * (1 - self.config.TAKE_PROFIT_PERCENT / 100)}
+
+                    self.positions.append(position)
+                    self.order_history.append(
+                        {'type': 'sell', 'price': price, 'amount': amount, 'timestamp': datetime.now()})
+                    logger.info(f"SELL order executed: Size={amount} contracts at market price {price}")
+                    return order
+                return None
+            else:
+                raise Exception("Exchange not initialized.")
+        except ccxt.NetworkError as e:
+            logger.error(f"Network error during trade execution: {e}")
+            return None
+        except ccxt.ExchangeError as e:
+            logger.error(f"Exchange error during trade execution: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Trade execution failed: {e}")
+            return None
+
+    def close_position(self, position):
+        """Close a specific position"""
+        try:
+            if self.exchange is not None:
+                amount = position['amount']
+                order = None
+                if position['type'] == "long":
+                    order = self.exchange.create_market_sell_order(
+                        symbol=self.config.SYMBOL, amount=amount, params={'tdMode': 'cross', 'posSide': 'short'}
+                    )
+                    latest_price = self.fetch_ohlcv_data()['close'].iloc[-1]
+                    self.order_history.append(
+                        {'type': 'close_long', 'price': latest_price, 'amount': amount, 'timestamp': datetime.now()})
+                    logger.info(f"Long position closed at {latest_price:.4f}")
+                elif position['type'] == "short":
+                    order = self.exchange.create_market_buy_order(
+                        symbol=self.config.SYMBOL, amount=amount, params={'tdMode': 'cross', 'posSide': 'long'}
+                    )
+                    latest_price = self.fetch_ohlcv_data()['close'].iloc[-1]
+                    self.order_history.append(
+                        {'type': 'close_short', 'price': latest_price, 'amount': amount, 'timestamp': datetime.now()})
+                    logger.info(f"Short position closed at {latest_price:.4f}")
+
+                self.positions.remove(position)  # Remove the closed position
+                return order
+            else:
+                raise Exception("Exchange not initialized")
+        except ccxt.NetworkError as e:
+            logger.error(f"Network error closing position: {e}")
+            return None
+        except ccxt.ExchangeError as e:
+            logger.error(f"Exchange error closing position: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to close position: {e}")
+            return None
+
+    def check_stop_loss_take_profit(self, current_price):
+        """Check stop loss and take profit for all open positions"""
+        positions_to_close = []
+        for position in self.positions:
+            if position['type'] == 'long':
+                if current_price <= position['stop_loss']:
+                    logger.info(f"Long position SL triggered at {current_price:.4f}")
+                    positions_to_close.append(position)
+                elif current_price >= position['take_profit']:
+                    logger.info(f"Long position TP triggered at {current_price:.4f}")
+                    positions_to_close.append(position)
+            elif position['type'] == 'short':
+                if current_price >= position['stop_loss']:
+                    logger.info(f"Short position SL triggered at {current_price:.4f}")
+                    positions_to_close.append(position)
+                elif current_price <= position['take_profit']:
+                    logger.info(f"Short position TP triggered at {current_price:.4f}")
+                    positions_to_close.append(position)
+
+        for position in positions_to_close:
+            self.close_position(position)  # Close positions
+        # No need to return anything.
+
+    def run(self):
+        """Main bot operation loop"""
+        if self.running:
+            logger.warning("Bot is already running.")
+            return
+
+        self.running = True
+        try:
+            self.initialize_exchange()
+            self.set_leverage()  # Set leverage at start
+        except Exception as e:
+            logger.error(f"Bot failed to start: {e}")
+            self.running = False
+            return
+
+        logger.info(f"Bot started: Trading {self.config.SYMBOL} on {self.config.TIMEFRAME} timeframe")
+        logger.info(f"Risk parameters: SL={self.config.STOP_LOSS_PERCENT}%, TP={self.config.TAKE_PROFIT_PERCENT}%")
+
+        while self.running:
+            try:
+                df = self.fetch_ohlcv_data()
+                if df is None:
+                    logger.warning("Failed to fetch data, retrying in 30 seconds...")
+                    time.sleep(30)
+                    continue
+
+                current_price = df['close'].iloc[-1]
+
+                # Check SL/TP for all positions
+                self.check_stop_loss_take_profit(current_price)
+
+                # Check for exit signals
+                positions_to_close = []
+                for position in self.positions:
+                    if self.check_exit_signal(df, position['type']):
+                        logger.info(f"Exit signal detected for {position['type']} position")
+                        positions_to_close.append(position)
+
+                for position in positions_to_close:
+                    self.close_position(position)
+
+                # Check for entry signals only if not already in a trade
+                if not self.positions:
+                    trend = self.check_directional_bias(df)
+                    signal = self.check_entry_signal(df)
+                    if signal:
+                        logger.info(f"Entry signal {signal} detected, trend is {trend}")
+                        order = self.execute_trade(signal, current_price)
+                        if order is None:
+                            logger.error(f"Failed to execute {signal} trade")
+                        else:
+                            logger.info(f"{signal.upper()} order executed")
+                        self.last_signal = signal #update last signal
+                elif self.positions: #check to enter again
+                    trend = self.check_directional_bias(df)
+                    signal = self.check_entry_signal(df)
+                    if signal and signal != self.last_signal:
+                        logger.info(f"Entry signal {signal} detected, trend is {trend}")
+                        order = self.execute_trade(signal, current_price)
+                        if order is None:
+                            logger.error(f"Failed to execute {signal} trade")
+                        else:
+                            logger.info(f"{signal.upper()} order executed")
+                        self.last_signal = signal
+                time.sleep(self.config.CHECK_INTERVAL)
+
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                time.sleep(30)
+
+    def stop(self):
+        """Stop the bot and close all positions"""
+        if not self.running:
+            logger.warning("Bot is not running.")
+            return
+        self.running = False
+
+        # Close all open positions
+        for position in list(self.positions):  # Iterate over a copy
+            self.close_position(position)
+        logger.info("Bot stopped and all positions closed")
+
+    def update_risk_parameters(self, stop_loss_percent=None, take_profit_percent=None):
+        """Update risk management parameters"""
+        if stop_loss_percent is not None:
+            self.config.STOP_LOSS_PERCENT = float(stop_loss_percent)
+            logger.info(f"Stop loss updated to {self.config.STOP_LOSS_PERCENT}%")
+
+        if take_profit_percent is not None:
+            self.config.TAKE_PROFIT_PERCENT = float(take_profit_percent)
+            logger.info(f"Take profit updated to {self.config.TAKE_PROFIT_PERCENT}%")
+
+    def update_leverage(self, leverage):
+        """Update leverage parameter"""
+        try:
+            self.config.LEVERAGE = int(leverage)
+            if self.running:
+                self.set_leverage()
+            logger.info(f"Leverage updated to {self.config.LEVERAGE}x")
+        except Exception as e:
+            logger.error(f"Failed to update leverage: {e}")
+
+    def get_order_history(self):
+        """Returns the order history"""
+        return self.order_history
+
+if __name__ == "__main__":
+    # Create the bot with configuration
+    config = Config()
+    bot = OKXEMABot(config)
+
+    try:
+        # Start the bot
+        bot.run()
+    except KeyboardInterrupt:
+        # Allow for clean exit with Ctrl+C
+        logger.info("Keyboard interrupt received, stopping bot")
+        bot.stop()
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        bot.stop()
