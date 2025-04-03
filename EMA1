@@ -4,37 +4,38 @@ import pandas as pd
 import logging
 from datetime import datetime
 
-# Setup logging to display bot activity
+# ----------------- Logging Setup -----------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger("MLTradingBot")
+logger = logging.getLogger("DualTFTradingBot")
 
-# API credentials for OKX (ensure these are for your test environment if using sandbox)
+# ----------------- API Credentials & Trading Configuration -----------------
 API_CREDENTIALS = {
     'api_key': '544d6587-0a7d-4b73-bb06-0e3656c08a18',
     'secret_key': '9C2CA165254391E4B4638DE6577288BD',
     'passphrase': '#Dinywa15'
 }
 
-# Trading configuration parameters
 TRADING_CONFIG = {
-    'symbol': "DOGE/USDT:USDT",    # Trading pair
-    'timeframe': "1m",             # Chart timeframe
-    'leverage': 50,                # Leverage for trading
-    'contract_size': 0.01,         # Trade size per order
-    'stop_loss_percent': 1.0,      # Stop loss percentage
-    'take_profit_percent': 2.0     # Take profit percentage
+    'symbol': "DOGE/USDT:USDT",
+    'leverage': 50,
+    'contract_size': 0.01,
+    # Timeframes: 15-minute for entry; 1-minute for confirmation and exit.
+    'entry_timeframe': "15m",
+    'exit_timeframe': "1m"
 }
 
-class MLTradingBot:
+# ----------------- Bot Class -----------------
+class DualTFTradingBot:
     def __init__(self, sandbox_mode=True):
         """
-        Initialize the trading bot.
-        - Creates the exchange instance with provided API credentials.
-        - Sets sandbox mode based on the parameter.
+        Initialize the bot:
+         - Creates the OKX exchange instance with provided API credentials.
+         - Sets sandbox mode appropriately.
+         - Initializes internal state.
         """
         try:
             self.exchange = ccxt.okx({
@@ -44,30 +45,27 @@ class MLTradingBot:
                 'enableRateLimit': True,
                 'options': {'defaultType': 'swap'}
             })
-            # Set sandbox mode if desired. Make sure your API keys match the selected environment.
+            # Set sandbox mode; make sure your API key is for the correct environment.
             self.exchange.set_sandbox_mode(sandbox_mode)
             logger.info(f"Exchange initialized successfully (Sandbox Mode: {sandbox_mode})")
         except Exception as e:
             logger.error(f"Error initializing exchange: {e}")
             raise
 
-        # Set trading parameters from configuration
         self.symbol = TRADING_CONFIG['symbol']
-        self.timeframe = TRADING_CONFIG['timeframe']
         self.leverage = TRADING_CONFIG['leverage']
         self.contract_size = TRADING_CONFIG['contract_size']
-        self.stop_loss_percent = TRADING_CONFIG['stop_loss_percent']
-        self.take_profit_percent = TRADING_CONFIG['take_profit_percent']
+        self.entry_timeframe = TRADING_CONFIG['entry_timeframe']
+        self.exit_timeframe = TRADING_CONFIG['exit_timeframe']
 
-        # Internal state
-        self.positions = []      # List to store open positions
-        self.order_history = []  # Log of orders
-        self.current_signal = None  # Current market signal ("buy" or "sell")
+        # Internal state: positions, current signal and running flag.
+        self.positions = []         # List of open positions
+        self.current_signal = None  # "buy" or "sell"
         self.running = False
 
     def set_leverage(self):
         """
-        Sets the leverage for the trading pair.
+        Set the desired leverage on the exchange.
         """
         try:
             self.exchange.set_leverage(self.leverage, self.symbol)
@@ -75,68 +73,102 @@ class MLTradingBot:
         except Exception as e:
             logger.error(f"Failed to set leverage: {e}")
 
-    def fetch_ohlcv_data(self, limit=None):
+    def fetch_ohlcv(self, timeframe, limit=250):
         """
-        Fetches OHLCV (candlestick) data from the exchange.
-        Optionally a limit can be passed for backtesting.
-        Calculates the necessary EMAs for decision making:
-          - EMA200: Trend bias
-          - EMA60 and EMA30: Entry signals
-          - EMA10: Exit signal
+        Fetches OHLCV data from the exchange for a given timeframe.
+        Calculates EMAs (for entry: EMA30, EMA60; for exit: EMA10, EMA30).
         """
         try:
-            fetch_limit = limit if limit is not None else 250
             ohlcv = self.exchange.fetch_ohlcv(
                 symbol=self.symbol,
-                timeframe=self.timeframe,
-                limit=fetch_limit
+                timeframe=timeframe,
+                limit=limit
             )
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
 
-            # Calculate exponential moving averages (EMAs)
-            df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
-            df['ema_60'] = df['close'].ewm(span=60, adjust=False).mean()
-            df['ema_30'] = df['close'].ewm(span=30, adjust=False).mean()
-            df['ema_10'] = df['close'].ewm(span=10, adjust=False).mean()
+            # Calculate required EMAs:
+            if timeframe == self.entry_timeframe:
+                # For entry signals, we need EMA30 and EMA60 (and optionally EMA10 for a higher timeframe check)
+                df['ema_30'] = df['close'].ewm(span=30, adjust=False).mean()
+                df['ema_60'] = df['close'].ewm(span=60, adjust=False).mean()
+                # Optional: also calculate EMA10 on 15m if needed.
+                df['ema_10'] = df['close'].ewm(span=10, adjust=False).mean()
+            elif timeframe == self.exit_timeframe:
+                # For exit and confirmation signals, we need EMA30, EMA60 and EMA10.
+                df['ema_30'] = df['close'].ewm(span=30, adjust=False).mean()
+                df['ema_60'] = df['close'].ewm(span=60, adjust=False).mean()
+                df['ema_10'] = df['close'].ewm(span=10, adjust=False).mean()
             return df
         except Exception as e:
-            logger.error(f"Error fetching OHLCV data: {e}")
+            logger.error(f"Error fetching OHLCV data for timeframe {timeframe}: {e}")
             return None
 
-    def check_entry_signal(self, df):
+    def get_entry_signal_15m(self, df):
         """
-        Determines the entry signal:
-          - "buy" signal if EMA30 > EMA60
-          - "sell" signal if EMA30 < EMA60
+        Determine the entry signal from 15-minute data:
+          - "buy" if EMA30 > EMA60
+          - "sell" if EMA30 < EMA60
         """
-        ema_30 = df['ema_30'].iloc[-1]
-        ema_60 = df['ema_60'].iloc[-1]
-        if ema_30 > ema_60:
-            return "buy"
-        elif ema_30 < ema_60:
-            return "sell"
-        return None
+        try:
+            ema_30 = df['ema_30'].iloc[-1]
+            ema_60 = df['ema_60'].iloc[-1]
+            if ema_30 > ema_60:
+                return "buy"
+            elif ema_30 < ema_60:
+                return "sell"
+            else:
+                return None
+        except Exception as e:
+            logger.error(f"Error determining 15m entry signal: {e}")
+            return None
 
-    def check_exit_signal(self, df, position_type):
+    def get_confirmation_signal_1m(self, df):
         """
-        Determines if the exit condition is met:
-          - For a long position ("buy"), exit if EMA10 < EMA30.
-          - For a short position ("sell"), exit if EMA10 > EMA30.
+        Determine the confirmation signal from 1-minute data:
+          - "buy" if EMA30 > EMA60
+          - "sell" if EMA30 < EMA60
+        This is used to confirm the 15-minute entry signal.
         """
-        ema_10 = df['ema_10'].iloc[-1]
-        ema_30 = df['ema_30'].iloc[-1]
-        if position_type == "long" and ema_10 < ema_30:
-            return True
-        elif position_type == "short" and ema_10 > ema_30:
-            return True
-        return False
+        try:
+            ema_30 = df['ema_30'].iloc[-1]
+            ema_60 = df['ema_60'].iloc[-1]
+            if ema_30 > ema_60:
+                return "buy"
+            elif ema_30 < ema_60:
+                return "sell"
+            else:
+                return None
+        except Exception as e:
+            logger.error(f"Error determining 1m confirmation signal: {e}")
+            return None
+
+    def get_exit_signal_1m(self, df, position_type):
+        """
+        Check the exit condition from the 1-minute data:
+          - For a long (buy) position, exit if EMA10 crosses below EMA30.
+          - For a short (sell) position, exit if EMA10 crosses above EMA30.
+        """
+        try:
+            ema_10 = df['ema_10'].iloc[-1]
+            ema_30 = df['ema_30'].iloc[-1]
+            if position_type == "buy" and ema_10 < ema_30:
+                return True
+            elif position_type == "sell" and ema_10 > ema_30:
+                return True
+            else:
+                return False
+        except Exception as e:
+            logger.error(f"Error determining 1m exit signal: {e}")
+            return False
 
     def execute_trade(self, trade_type, price):
         """
-        Executes a market order based on the provided trade_type.
-        Logs the order and stores the new position.
+        Execute a trade:
+          - For a "buy", open a long position.
+          - For a "sell", open a short position.
+        The bot scales into the position if conditions remain.
         """
         try:
             amount = self.contract_size
@@ -144,37 +176,19 @@ class MLTradingBot:
             order = None
 
             if trade_type == "buy":
-                # Execute market buy order for a long position
+                # Execute a market buy order for long position.
                 order = self.exchange.create_market_buy_order(
                     symbol=self.symbol, amount=amount, params={**params, 'posSide': 'long'}
                 )
-                position = {
-                    'type': 'long',
-                    'price': price,
-                    'amount': amount,
-                    'timestamp': datetime.now(),
-                    'stop_loss': price * (1 - self.stop_loss_percent / 100),
-                    'take_profit': price * (1 + self.take_profit_percent / 100)
-                }
-                self.positions.append(position)
-                self.order_history.append({'type': 'buy', 'price': price, 'amount': amount, 'timestamp': datetime.now()})
+                self.positions.append({'type': 'buy', 'price': price, 'timestamp': datetime.now()})
                 logger.info(f"Executed BUY order: {amount} at {price}")
 
             elif trade_type == "sell":
-                # Execute market sell order for a short position
+                # Execute a market sell order for short position.
                 order = self.exchange.create_market_sell_order(
                     symbol=self.symbol, amount=amount, params={**params, 'posSide': 'short'}
                 )
-                position = {
-                    'type': 'short',
-                    'price': price,
-                    'amount': amount,
-                    'timestamp': datetime.now(),
-                    'stop_loss': price * (1 + self.stop_loss_percent / 100),
-                    'take_profit': price * (1 - self.take_profit_percent / 100)
-                }
-                self.positions.append(position)
-                self.order_history.append({'type': 'sell', 'price': price, 'amount': amount, 'timestamp': datetime.now()})
+                self.positions.append({'type': 'sell', 'price': price, 'timestamp': datetime.now()})
                 logger.info(f"Executed SELL order: {amount} at {price}")
 
             return order
@@ -182,107 +196,118 @@ class MLTradingBot:
             logger.error(f"Error executing trade: {e}")
             return None
 
-    def close_position(self, position):
+    def close_all_positions(self):
         """
-        Closes a specific position by executing an opposite market order.
+        Close all open positions immediately.
+        Ensures that we don't have a mix of both buy and sell orders.
         """
         try:
-            amount = position['amount']
-            latest_price = self.fetch_ohlcv_data()['close'].iloc[-1]
-            order = None
-            if position['type'] == "long":
-                # Close a long position with a market sell order
-                order = self.exchange.create_market_sell_order(
-                    symbol=self.symbol, amount=amount, params={'tdMode': 'cross', 'posSide': 'short'}
-                )
-                self.order_history.append({'type': 'close_long', 'price': latest_price, 'amount': amount, 'timestamp': datetime.now()})
-                logger.info(f"Closed LONG position at {latest_price}")
-            elif position['type'] == "short":
-                # Close a short position with a market buy order
-                order = self.exchange.create_market_buy_order(
-                    symbol=self.symbol, amount=amount, params={'tdMode': 'cross', 'posSide': 'long'}
-                )
-                self.order_history.append({'type': 'close_short', 'price': latest_price, 'amount': amount, 'timestamp': datetime.now()})
-                logger.info(f"Closed SHORT position at {latest_price}")
-            
-            self.positions.remove(position)
-            return order
+            if not self.positions:
+                return
+
+            # Use the 1m timeframe to get the latest price for closing.
+            df_exit = self.fetch_ohlcv(self.exit_timeframe, limit=50)
+            if df_exit is None:
+                logger.error("Unable to fetch data for closing positions.")
+                return
+
+            latest_price = df_exit['close'].iloc[-1]
+            for position in list(self.positions):
+                amount = self.contract_size
+                params = {'tdMode': 'cross'}
+                if position['type'] == "buy":
+                    # Close long by selling
+                    self.exchange.create_market_sell_order(
+                        symbol=self.symbol, amount=amount, params={**params, 'posSide': 'short'}
+                    )
+                    logger.info(f"Closed BUY position at {latest_price}")
+                elif position['type'] == "sell":
+                    # Close short by buying
+                    self.exchange.create_market_buy_order(
+                        symbol=self.symbol, amount=amount, params={**params, 'posSide': 'long'}
+                    )
+                    logger.info(f"Closed SELL position at {latest_price}")
+                # Remove the position from the list
+                self.positions.remove(position)
+            # Reset current signal after closing
+            self.current_signal = None
         except Exception as e:
-            logger.error(f"Error closing position: {e}")
-            return None
+            logger.error(f"Error closing positions: {e}")
 
     def run(self):
         """
-        Main live trading loop:
-          - Checks market data every minute.
-          - Adds a new trade if the current signal is valid and market conditions persist.
-          - Closes all positions if a signal reversal occurs.
-          - Continuously checks stop loss, take profit, and exit conditions.
+        Main trading loop:
+          - Every minute, fetch both 15m and 1m data.
+          - Generate an entry signal from the 15m data.
+          - Confirm the entry using the 1m data.
+          - Check the exit condition on the 1m data.
+          - If an exit or reversal is detected, close all positions immediately.
+          - Otherwise, if entry conditions are confirmed and no conflicting position exists,
+            execute a trade (scaling into the position if already in a trade of the same type).
         """
         if self.running:
             logger.warning("Bot is already running.")
             return
 
         self.running = True
-
-        # Set leverage once at startup
         self.set_leverage()
-        logger.info(f"Bot started: Trading {self.symbol} on {self.timeframe} timeframe")
-        logger.info(f"Risk parameters: SL={self.stop_loss_percent}%, TP={self.take_profit_percent}%")
-
+        logger.info(f"Bot started: Trading {self.symbol}")
+        
         while self.running:
             try:
-                # Fetch latest market data
-                df = self.fetch_ohlcv_data()
-                if df is None:
-                    logger.warning("Failed to fetch data, retrying in 30 seconds...")
-                    time.sleep(30)
+                # Fetch data for both timeframes
+                df_15m = self.fetch_ohlcv(self.entry_timeframe, limit=100)
+                df_1m = self.fetch_ohlcv(self.exit_timeframe, limit=100)
+
+                if df_15m is None or df_1m is None:
+                    logger.warning("Failed to fetch data for one or both timeframes, retrying...")
+                    time.sleep(60)
                     continue
 
-                current_price = df['close'].iloc[-1]
+                # Determine primary 15m entry signal
+                entry_signal_15m = self.get_entry_signal_15m(df_15m)
+                # Determine 1m confirmation signal for entry
+                confirm_signal_1m = self.get_confirmation_signal_1m(df_1m)
 
-                # Check for stop loss or take profit for each open position
-                for position in list(self.positions):
-                    if position['type'] == 'long' and current_price <= position['stop_loss']:
-                        logger.info("Long position stop loss triggered.")
-                        self.close_position(position)
-                    elif position['type'] == 'long' and current_price >= position['take_profit']:
-                        logger.info("Long position take profit triggered.")
-                        self.close_position(position)
-                    elif position['type'] == 'short' and current_price >= position['stop_loss']:
-                        logger.info("Short position stop loss triggered.")
-                        self.close_position(position)
-                    elif position['type'] == 'short' and current_price <= position['take_profit']:
-                        logger.info("Short position take profit triggered.")
-                        self.close_position(position)
+                # Check for exit signal on 1m for any open positions
+                exit_trigger = False
+                if self.positions:
+                    # Get the type of the open position (all positions are of same type by design)
+                    current_position_type = self.positions[0]['type']
+                    if self.get_exit_signal_1m(df_1m, current_position_type):
+                        exit_trigger = True
 
-                # Check exit signal for each open position based on EMA10 vs EMA30
-                for position in list(self.positions):
-                    if self.check_exit_signal(df, position['type']):
-                        logger.info(f"Exit signal detected for {position['type']} position.")
-                        self.close_position(position)
-
-                # Determine the current entry signal (using EMA30 vs EMA60)
-                entry_signal = self.check_entry_signal(df)
-                if entry_signal:
-                    # If signal reversal occurs, close all open positions
-                    if self.current_signal and entry_signal != self.current_signal:
-                        logger.info(f"Signal changed from {self.current_signal} to {entry_signal}. Closing all positions.")
-                        for position in list(self.positions):
-                            self.close_position(position)
-                    
-                    # Update current signal and add a new trade for this minute if conditions are valid.
-                    self.current_signal = entry_signal
-                    logger.info(f"Market signal is '{entry_signal}'. Adding a new trade at {current_price}.")
-                    self.execute_trade(entry_signal, current_price)
+                # If exit trigger is met OR the 15m signal reverses (relative to open position), close all positions.
+                if exit_trigger:
+                    logger.info("Exit condition met on 1m. Closing all positions.")
+                    self.close_all_positions()
+                elif self.positions and entry_signal_15m != self.current_signal:
+                    logger.info("15m signal has reversed relative to open positions. Closing all positions.")
+                    self.close_all_positions()
                 else:
-                    logger.info("No valid entry signal detected.")
+                    # Only proceed with entry if there are no open positions OR we're scaling in on the same signal.
+                    if not self.positions:
+                        # Entry only if 15m signal equals 1m confirmation
+                        if entry_signal_15m and entry_signal_15m == confirm_signal_1m:
+                            logger.info(f"Entry confirmed: {entry_signal_15m} signal on both 15m and 1m.")
+                            self.execute_trade(entry_signal_15m, df_1m['close'].iloc[-1])
+                            self.current_signal = entry_signal_15m
+                        else:
+                            logger.info("Entry conditions not met on 1m confirmation.")
+                    else:
+                        # If positions are already open and the signal is the same,
+                        # scale into the position (i.e. add another trade).
+                        if entry_signal_15m and entry_signal_15m == self.current_signal and entry_signal_15m == confirm_signal_1m:
+                            logger.info(f"Signal remains valid ({entry_signal_15m}). Scaling in at price {df_1m['close'].iloc[-1]}.")
+                            self.execute_trade(entry_signal_15m, df_1m['close'].iloc[-1])
+                        else:
+                            logger.info("Current market conditions do not support scaling in.")
 
-                # Wait for 60 seconds before checking again
+                # Wait one minute before the next cycle.
                 time.sleep(60)
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
-                time.sleep(30)
+                time.sleep(60)
 
     def stop(self):
         """
@@ -293,15 +318,12 @@ class MLTradingBot:
             return
 
         self.running = False
-        for position in list(self.positions):
-            self.close_position(position)
+        self.close_all_positions()
         logger.info("Bot stopped and all positions closed.")
 
+# ----------------- Main Execution -----------------
 if __name__ == "__main__":
-    # Create bot instance; change sandbox_mode to False for live trading.
-    bot = MLTradingBot(sandbox_mode=True)
-    
-    # Uncomment the next block to run the bot for live trading.
+    bot = DualTFTradingBot(sandbox_mode=True)  # Use sandbox mode; set to False for live trading.
     try:
         bot.run()
     except KeyboardInterrupt:
