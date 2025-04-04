@@ -3,6 +3,37 @@ import ccxt
 import pandas as pd
 import logging
 from datetime import datetime
+import math
+
+# -----------------------------------------------------------------------------
+# Configuration Area - Adjust parameters here
+# -----------------------------------------------------------------------------
+BOT_CONFIG = {
+    # == Exchange & API ==
+    'exchange_id': 'okx', # CCXT exchange ID
+    'api_key': '6aca6793-d892-474d-b119-739b60c8a3c8',
+    'secret_key': '1693D0A1C415A3346326B15B8E42BA04',
+    'passphrase': '#Dinywa15',
+    'sandbox_mode': True, # <<< SET TO False FOR LIVE TRADING >>>
+
+    # == Trading Strategy ==
+    'symbol': "DOGE/USDT:USDT", # Trading pair
+    'leverage': 49,            # Desired leverage
+    'contract_size': 0.1,     # Size for each individual scaling-in order
+    'entry_timeframe': "15m",  # Timeframe for primary EMA signal (30/60)
+    'exit_timeframe': "1m",    # Timeframe for confirmation (30/60) & exit (10/30)
+
+    # == Risk Management ==
+    'tp_percentage': 30.0,  # Take Profit % based on Return on Margin (RoM)
+    'sl_percentage': 10.0,  # Stop Loss % based on Return on Margin (RoM)
+
+    # == Bot Internals ==
+    'margin_mode': 'isolated', # 'cross' or 'isolated' (MUST match account setting for the symbol)
+    # Tolerance factor for checking if position is closed (e.g., 0.1 = 10% of contract size)
+    'close_tolerance_factor': 0.1,
+    'loop_sleep_seconds': 60 # Time between cycles
+}
+# -----------------------------------------------------------------------------
 
 # ----------------- Logging Setup -----------------
 logging.basicConfig(
@@ -10,540 +41,488 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger("DualTFTradingBot")
-
-# ----------------- API Credentials & Trading Configuration -----------------
-# Use the NEW API Keys provided
-API_CREDENTIALS = {
-    'api_key': '6aca6793-d892-474d-b119-739b60c8a3c8', # Updated API Key
-    'secret_key': '1693D0A1C415A3346326B15B8E42BA04', # Updated Secret Key
-    'passphrase': '#Dinywa15' # Keep the same passphrase
-}
-
-TRADING_CONFIG = {
-    'symbol': "DOGE/USDT:USDT",
-    'leverage': 50,
-    'contract_size': 0.01, # Define the size for each individual trade order
-    # Timeframes: 15-minute for entry signal; 1-minute for confirmation and exit.
-    'entry_timeframe': "15m",
-    'exit_timeframe': "1m"
-}
+logger = logging.getLogger("DualTFTradingBot_TP_SL")
 
 # ----------------- Bot Class -----------------
 class DualTFTradingBot:
-    def __init__(self, sandbox_mode=True):
-        """
-        Initialize the bot:
-         - Creates the OKX exchange instance with provided API credentials.
-         - Sets sandbox mode appropriately.
-         - Initializes internal state.
-        """
+    def __init__(self, config):
+        """ Initialize bot using the config dictionary """
+        self.config = config
+        self.exchange_id = config['exchange_id']
+        self.sandbox_mode = config['sandbox_mode']
+
         try:
-            self.exchange = ccxt.okx({
-                'apiKey': API_CREDENTIALS['api_key'],
-                'secret': API_CREDENTIALS['secret_key'],
-                'password': API_CREDENTIALS['passphrase'],
+            exchange_class = getattr(ccxt, self.exchange_id)
+            self.exchange = exchange_class({
+                'apiKey': config['api_key'],
+                'secret': config['secret_key'],
+                'password': config['passphrase'],
                 'enableRateLimit': True,
-                'options': {
-                    'defaultType': 'swap', # Ensure we are trading swaps/futures
-                    # Setting hedge mode might be necessary depending on account settings
-                    # 'hedgeMode': True, # Uncomment if using hedge mode on OKX
-                    # 'recvWindow': 10000 # Optional: Increase if getting timestamp errors
-                    }
+                'options': {'defaultType': 'swap'}
             })
-            # Set sandbox mode; make sure your API key is for the correct environment.
-            self.exchange.set_sandbox_mode(sandbox_mode)
-            logger.info(f"Exchange initialized successfully (Sandbox Mode: {sandbox_mode})")
+            self.exchange.set_sandbox_mode(self.sandbox_mode)
+            logger.info(f"Exchange '{self.exchange_id}' initialized (Sandbox: {self.sandbox_mode}) for ONE-WAY Mode w/ Close Confirmation & TP/SL.")
 
-            # Load markets to ensure symbol details are available
             self.exchange.load_markets()
-            market = self.exchange.market(TRADING_CONFIG['symbol'])
-            # Get the minimum contract size if needed (useful for dynamic sizing)
-            # self.min_contract_size = market.get('limits', {}).get('amount', {}).get('min')
+            self.market = self.exchange.market(config['symbol'])
+            # Precision and Limits
+            self.amount_precision = self.market.get('precision', {}).get('amount')
+            if self.amount_precision is None:
+                 logger.warning(f"Amount precision not found for {config['symbol']}. Using default 8.")
+                 self.amount_precision = 8
+            else:
+                 self.amount_precision = int(self.amount_precision)
+            logger.info(f"Amount precision for {config['symbol']}: {self.amount_precision} decimal places.")
+            self.min_amount = self.market.get('limits', {}).get('amount', {}).get('min')
+            if self.min_amount is None: logger.warning("Minimum order amount not found.")
 
-        except ccxt.AuthenticationError as e:
-            logger.error(f"Authentication Error initializing exchange: {e}")
-            logger.error("Please check your API Key, Secret Key, and Passphrase.")
-            raise
-        except ccxt.ExchangeError as e:
-            logger.error(f"Exchange Error initializing exchange: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Generic Error initializing exchange: {e}")
-            raise
 
-        self.symbol = TRADING_CONFIG['symbol']
-        self.leverage = TRADING_CONFIG['leverage']
-        self.contract_size = TRADING_CONFIG['contract_size']
-        self.entry_timeframe = TRADING_CONFIG['entry_timeframe']
-        self.exit_timeframe = TRADING_CONFIG['exit_timeframe']
+        except ccxt.AuthenticationError as e: logger.error(f"Authentication Error: {e}"); raise
+        except ccxt.ExchangeError as e: logger.error(f"Exchange Setup Error: {e}"); raise
+        except Exception as e: logger.error(f"Initialization Error: {e}"); raise
 
-        # Internal state: positions, current signal and running flag.
-        self.positions = []       # List to track individual trade entries
-        self.current_signal = None  # Tracks the signal of the *current active* position sequence ("buy" or "sell")
+        # --- Configured Parameters ---
+        self.symbol = config['symbol']
+        self.leverage = config['leverage']
+        self.contract_size = config['contract_size']
+        self.entry_timeframe = config['entry_timeframe']
+        self.exit_timeframe = config['exit_timeframe']
+        self.tp_percentage = config['tp_percentage']
+        self.sl_percentage = config['sl_percentage'] # Should be positive
+        self.margin_mode = config['margin_mode']
+        self.close_tolerance = self.contract_size * config['close_tolerance_factor']
+        self.loop_sleep = config['loop_sleep_seconds']
+
+        # --- State Variables ---
+        self.positions = []       # Tracks individual trade entry details (optional now?)
+        self.current_signal = None  # Active position signal ("buy" or "sell")
         self.running = False
+        self.waiting_for_close_confirmation = False
+
+        # --- State for RoM Calculation ---
+        self.total_contracts = 0.0   # Current position size
+        self.sum_entry_value = 0.0   # Sum of (size * price) for entries
+        self.average_entry_price = 0.0 # Calculated average entry price
+
+    def truncate(self, number, digits):
+        if digits is None: return number
+        # Ensure digits is a non-negative integer before using it
+        try:
+            digits = max(0, int(digits)) 
+            stepper = 10.0 ** digits
+            return math.trunc(stepper * number) / stepper
+        except (ValueError, TypeError):
+             logger.error(f"Invalid precision digits: {digits}. Returning original number.")
+             return number
+
 
     def set_leverage(self):
-        """
-        Set the desired leverage on the exchange for the specific symbol.
-        Uses unified method for setting leverage.
-        """
+        """ Set leverage for One-Way Mode """
         try:
-            # OKX requires specifying marginMode (cross/isolated) and positionSide (net/long/short)
-            # Assuming 'cross' margin and setting for both long/short sides in hedge mode,
-            # or just setting generally if in one-way mode.
-            # Note: Setting leverage might differ slightly based on account mode (one-way vs hedge)
-            params = {'marginMode': 'cross'} # Or 'isolated'
-            # Set for both sides if in Hedge Mode
-            # self.exchange.set_leverage(self.leverage, self.symbol, {'posSide': 'long', **params})
-            # self.exchange.set_leverage(self.leverage, self.symbol, {'posSide': 'short', **params})
-            # If in One-Way mode, this should suffice:
+            params = {'marginMode': self.margin_mode}
+            logger.info(f"Attempting leverage set to {self.leverage}x for {self.symbol} (One-Way) with params {params}")
             self.exchange.set_leverage(self.leverage, self.symbol, params)
-
-            logger.info(f"Attempted to set leverage to {self.leverage}x for {self.symbol} with params {params}")
+            logger.info(f"Leverage setting submitted for {self.symbol}.")
         except ccxt.ExchangeError as e:
-             # Handle specific errors, e.g., if leverage cannot be set while positions are open
-            if 'position is not empty' in str(e):
-                logger.warning(f"Could not set leverage for {self.symbol}: Open positions exist. {e}")
-            elif 'Leverage is not modified' in str(e):
-                 logger.info(f"Leverage for {self.symbol} already set to {self.leverage}x.")
-            else:
-                logger.error(f"Failed to set leverage for {self.symbol}: {e}")
-        except Exception as e:
-            logger.error(f"An unexpected error occurred while setting leverage: {e}")
-
+            if 'position is not empty' in str(e).lower() or 'position exists' in str(e).lower(): logger.warning(f"Leverage not set: Open positions exist. ({e})")
+            elif 'leverage is not modified' in str(e).lower(): logger.info(f"Leverage already set to {self.leverage}x.")
+            elif 'margin mode should be the same' in str(e).lower(): logger.error(f"Leverage Fail: Margin Mode ({params['marginMode']}) mismatch? Check Account settings. ({e})")
+            else: logger.error(f"Exchange error setting leverage: {e}")
+        except Exception as e: logger.error(f"Unexpected error setting leverage: {e}")
 
     def fetch_ohlcv(self, timeframe, limit=250):
-        """
-        Fetches OHLCV data from the exchange for a given timeframe.
-        Calculates required EMAs.
-        """
+        """ Fetches OHLCV data and calculates required EMAs """
         try:
-            ohlcv = self.exchange.fetch_ohlcv(
-                symbol=self.symbol,
-                timeframe=timeframe,
-                limit=limit
-            )
-            if not ohlcv: # Check if data is empty
-                logger.warning(f"No OHLCV data returned for {self.symbol} timeframe {timeframe}.")
-                return None
-
+            ohlcv = self.exchange.fetch_ohlcv(self.symbol, timeframe, limit=limit)
+            if not ohlcv: logger.warning(f"No OHLCV data for {timeframe}."); return None
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
-
-            # Calculate required EMAs:
-            if timeframe == self.entry_timeframe: # 15m
-                # For entry signals, we need EMA30 and EMA60
+            # Calculate EMAs
+            if timeframe == self.entry_timeframe:
                 df['ema_30'] = df['close'].ewm(span=30, adjust=False).mean()
                 df['ema_60'] = df['close'].ewm(span=60, adjust=False).mean()
-            elif timeframe == self.exit_timeframe: # 1m
-                # For exit and confirmation signals, we need EMA10, EMA30 and EMA60
+            elif timeframe == self.exit_timeframe:
                 df['ema_10'] = df['close'].ewm(span=10, adjust=False).mean()
                 df['ema_30'] = df['close'].ewm(span=30, adjust=False).mean()
                 df['ema_60'] = df['close'].ewm(span=60, adjust=False).mean()
-
-            # Ensure calculations didn't produce NaNs at the end
-            if df.iloc[-1].isnull().any():
-                logger.warning(f"NaN values found in latest candle for {timeframe}. Data might be incomplete.")
-                # Optionally return None or handle this case (e.g., use previous candle)
-                # return None # Or proceed cautiously
+            if df.iloc[-1].isnull().any(): logger.warning(f"NaN in latest {timeframe} candle.")
             return df
+        except Exception as e: logger.error(f"Error fetching/processing {timeframe} OHLCV: {e}"); return None
 
-        except ccxt.NetworkError as e:
-            logger.error(f"Network error fetching OHLCV for {timeframe}: {e}")
-            return None
-        except ccxt.ExchangeError as e:
-             logger.error(f"Exchange error fetching OHLCV for {timeframe}: {e}")
-             return None
-        except Exception as e:
-            logger.error(f"Error fetching/processing OHLCV data for timeframe {timeframe}: {e}")
-            return None
-
+    # --- Signal Functions (get_entry_signal_15m, get_confirmation_signal_1m, get_exit_signal_1m) ---
+    # No changes needed in the signal calculation logic itself.
     def get_entry_signal_15m(self, df):
-        """
-        Determine the primary trend signal from 15-minute data:
-         - "buy" if EMA30 > EMA60
-         - "sell" if EMA30 < EMA60
-        """
-        if df is None or len(df) < 60: # Ensure enough data for EMAs
-             logger.warning("Not enough data on 15m timeframe for entry signal.")
-             return None
+        if df is None or len(df) < 60: return None
         try:
-            # Use the second to last candle to avoid issues with incomplete current candle
-            last_complete_candle = df.iloc[-2]
-            ema_30 = last_complete_candle['ema_30']
-            ema_60 = last_complete_candle['ema_60']
-
-            if ema_30 > ema_60:
-                return "buy"
-            elif ema_30 < ema_60:
-                return "sell"
-            else:
-                return None # No clear signal if EMAs are equal
-        except IndexError:
-             logger.error("Index error accessing EMA data on 15m timeframe. Not enough rows?")
-             return None
-        except KeyError as e:
-             logger.error(f"Missing expected EMA column on 15m df: {e}")
-             return None
-        except Exception as e:
-            logger.error(f"Error determining 15m entry signal: {e}")
+            last_complete = df.iloc[-2]; ema30 = last_complete['ema_30']; ema60 = last_complete['ema_60']
+            if pd.isna(ema30) or pd.isna(ema60): return None # Handle NaN EMAs
+            if ema30 > ema60: return "buy"
+            if ema30 < ema60: return "sell"
             return None
+        except Exception as e: logger.error(f"Error in get_entry_signal_15m: {e}"); return None
 
     def get_confirmation_signal_1m(self, df):
-        """
-        Determine the confirmation signal from 1-minute data:
-         - "buy" if EMA30 > EMA60
-         - "sell" if EMA30 < EMA60
-        This confirms the direction indicated by the 15m signal for trade entry.
-        """
-        if df is None or len(df) < 60: # Ensure enough data for EMAs
-             logger.warning("Not enough data on 1m timeframe for confirmation signal.")
-             return None
+        if df is None or len(df) < 60: return None
         try:
-            # Use the second to last candle for confirmation as well
-            last_complete_candle = df.iloc[-2]
-            ema_30 = last_complete_candle['ema_30']
-            ema_60 = last_complete_candle['ema_60']
-
-            if ema_30 > ema_60:
-                return "buy"
-            elif ema_30 < ema_60:
-                return "sell"
-            else:
-                return None # No clear signal if EMAs are equal
-        except IndexError:
-             logger.error("Index error accessing EMA data on 1m timeframe (confirmation). Not enough rows?")
-             return None
-        except KeyError as e:
-             logger.error(f"Missing expected EMA column on 1m df (confirmation): {e}")
-             return None
-        except Exception as e:
-            logger.error(f"Error determining 1m confirmation signal: {e}")
+            last_complete = df.iloc[-2]; ema30 = last_complete['ema_30']; ema60 = last_complete['ema_60']
+            if pd.isna(ema30) or pd.isna(ema60): return None
+            if ema30 > ema60: return "buy"
+            if ema30 < ema60: return "sell"
             return None
+        except Exception as e: logger.error(f"Error in get_confirmation_signal_1m: {e}"); return None
 
     def get_exit_signal_1m(self, df, position_type):
-        """
-        Check the exit condition from the 1-minute data based on EMA10/EMA30 cross:
-         - For a long (buy) position, exit if EMA10 crosses *below* EMA30.
-         - For a short (sell) position, exit if EMA10 crosses *above* EMA30.
-        """
-        if df is None or len(df) < 30: # Need EMA10 and EMA30
-            logger.warning("Not enough data on 1m timeframe for exit signal.")
-            return False # Cannot determine exit, safer to assume no exit signal
-
+        if df is None or len(df) < 30: return False
         try:
-            # Check the crossover based on the last two candles
-            # Current state: last candle [-1]
-            # Previous state: second to last candle [-2]
-            ema_10_prev = df['ema_10'].iloc[-2]
-            ema_30_prev = df['ema_30'].iloc[-2]
-            ema_10_curr = df['ema_10'].iloc[-1]
-            ema_30_curr = df['ema_30'].iloc[-1]
-
-            # Exit Long if EMA10 crosses BELOW EMA30
-            if position_type == "buy" and ema_10_prev >= ema_30_prev and ema_10_curr < ema_30_curr:
-                 logger.info(f"Exit Signal (Long): 1m EMA10 ({ema_10_curr:.5f}) crossed below EMA30 ({ema_30_curr:.5f})")
+            ema10_prev, ema30_prev = df['ema_10'].iloc[-2], df['ema_30'].iloc[-2]
+            ema10_curr, ema30_curr = df['ema_10'].iloc[-1], df['ema_30'].iloc[-1]
+            if pd.isna(ema10_prev) or pd.isna(ema30_prev) or pd.isna(ema10_curr) or pd.isna(ema30_curr): return False # Handle NaN
+            
+            if position_type == "buy" and ema10_prev >= ema30_prev and ema10_curr < ema30_curr:
+                 logger.info(f"Exit Signal (Long): 1m EMA10 ({ema10_curr:.5f}) < EMA30 ({ema30_curr:.5f}) crossover.")
                  return True
-            # Exit Short if EMA10 crosses ABOVE EMA30
-            elif position_type == "sell" and ema_10_prev <= ema_30_prev and ema_10_curr > ema_30_curr:
-                 logger.info(f"Exit Signal (Short): 1m EMA10 ({ema_10_curr:.5f}) crossed above EMA30 ({ema_30_curr:.5f})")
+            elif position_type == "sell" and ema10_prev <= ema30_prev and ema10_curr > ema30_curr:
+                 logger.info(f"Exit Signal (Short): 1m EMA10 ({ema10_curr:.5f}) > EMA30 ({ema30_curr:.5f}) crossover.")
                  return True
-            else:
-                return False # No exit crossover detected
-        except IndexError:
-             logger.error("Index error accessing EMA data on 1m timeframe (exit). Not enough rows?")
-             return False
-        except KeyError as e:
-             logger.error(f"Missing expected EMA column on 1m df (exit): {e}")
-             return False
-        except Exception as e:
-            logger.error(f"Error determining 1m exit signal: {e}")
-            return False # Safer to assume no exit signal on error
+            return False
+        except Exception as e: logger.error(f"Error determining 1m exit signal: {e}"); return False
 
-    def get_total_position_size(self, side):
-        """Calculate the total size of open positions for a given side ('buy' or 'sell')."""
-        total_size = 0
-        for pos in self.positions:
-            if pos['type'] == side:
-                total_size += self.contract_size # Assuming each entry in self.positions is one unit of contract_size
-        return total_size
-
-    def execute_trade(self, trade_type, price):
-        """
-        Execute a trade (market order):
-         - For a "buy", open a long position.
-         - For a "sell", open a short position.
-        Adds the executed trade details to self.positions.
-        """
+    def execute_trade(self, trade_type, price_estimate):
+        """ Execute opening/scaling trade, updating RoM state. """
         try:
             amount = self.contract_size
-            # Parameters for OKX swap orders
-            # 'tdMode': 'cross' or 'isolated' - should match account/leverage setting
-            # 'posSide': 'long' or 'short' - Required in hedge mode, specifies which side to open/add to.
-            params = {'tdMode': 'cross'} # Ensure this matches your margin mode setting
+            # Apply precision truncation
+            amount = self.truncate(amount, self.amount_precision)
+            if amount <= 0: logger.error(f"Trade amount truncated to zero."); return None
+            # Check against minimum amount if available
+            if self.min_amount is not None and amount < self.min_amount:
+                logger.error(f"Trade amount {amount} is below minimum {self.min_amount}. Cannot execute.")
+                return None
+
+            params = {'tdMode': self.margin_mode}
             order = None
+            side = trade_type.upper()
 
-            if trade_type == "buy":
-                # Execute a market buy order to open/increase a long position.
-                params['posSide'] = 'long'
-                logger.info(f"Attempting to place MARKET BUY order: Symbol={self.symbol}, Amount={amount}, Params={params}")
-                order = self.exchange.create_market_buy_order(
-                    symbol=self.symbol,
-                    amount=amount,
-                    params=params
-                )
-                self.positions.append({'type': 'buy', 'price': order['price'], 'timestamp': datetime.now(), 'id': order['id']})
-                logger.info(f"Executed BUY order: {amount} {self.symbol} at price {order.get('price', 'N/A')}. Order ID: {order['id']}")
+            logger.info(f"Attempting MARKET {side} (One-Way): Amount={amount}, Params={params}")
+            if trade_type == "buy": order = self.exchange.create_market_buy_order(self.symbol, amount, params)
+            elif trade_type == "sell": order = self.exchange.create_market_sell_order(self.symbol, amount, params)
 
-            elif trade_type == "sell":
-                # Execute a market sell order to open/increase a short position.
-                params['posSide'] = 'short'
-                logger.info(f"Attempting to place MARKET SELL order: Symbol={self.symbol}, Amount={amount}, Params={params}")
-                order = self.exchange.create_market_sell_order(
-                    symbol=self.symbol,
-                    amount=amount,
-                    params=params
-                )
-                self.positions.append({'type': 'sell', 'price': order['price'], 'timestamp': datetime.now(), 'id': order['id']})
-                logger.info(f"Executed SELL order: {amount} {self.symbol} at price {order.get('price', 'N/A')}. Order ID: {order['id']}")
+            if order and order.get('id'):
+                # Use average price if available, otherwise estimate; prefer 'average' over 'price' for market orders
+                filled_price = order.get('average', order.get('price', price_estimate))
+                filled_amount = order.get('filled', amount) # Use filled amount from order if available
 
-            return order
-        except ccxt.InsufficientFunds as e:
-            logger.error(f"Insufficient funds to execute {trade_type} order: {e}")
-            # Consider stopping the bot or pausing if funds run out
-            # self.stop()
-            return None
-        except ccxt.ExchangeError as e:
-            logger.error(f"Exchange error executing {trade_type} trade: {e}")
-            # Specific error handling (e.g., order validation, size limits) could go here
-            return None
-        except Exception as e:
-            logger.error(f"Error executing {trade_type} trade: {e}")
-            return None
+                if filled_amount is None or filled_amount <= 0:
+                     logger.warning(f"Order {order['id']} reported zero filled amount. Assuming intended amount {amount} for tracking.")
+                     filled_amount = amount # Fallback for tracking
+                     
+                if filled_price is None:
+                    logger.warning(f"Order {order['id']} did not provide fill price. Using estimate {price_estimate}.")
+                    filled_price = price_estimate
+
+                logger.info(f"Executed {side} order: {filled_amount} @ {filled_price}. ID: {order['id']}")
+
+                # --- Update State for RoM Calculation ---
+                self.total_contracts += filled_amount
+                self.sum_entry_value += filled_amount * filled_price
+                if self.total_contracts > self.close_tolerance: # Avoid division by zero later
+                     self.average_entry_price = self.sum_entry_value / self.total_contracts
+                else: # Reset if total contracts becomes near zero
+                     self.average_entry_price = 0.0
+                     self.sum_entry_value = 0.0 # Should already be near zero
+                     self.total_contracts = 0.0
+                
+                # Add basic details to self.positions list (optional, less critical now)
+                self.positions.append({'type': trade_type, 'id': order['id'], 'size': filled_amount, 'price': filled_price})
+
+                return order
+            else:
+                 logger.error(f"Market {side} order failed or didn't return expected info. Order Response: {order}")
+                 return None
+        except ccxt.InsufficientFunds as e: logger.error(f"Insufficient funds for {trade_type}: {e}"); return None
+        except ccxt.ExchangeError as e: logger.error(f"Exchange error executing {trade_type}: {e}"); return None
+        except Exception as e: logger.error(f"Error executing {trade_type}: {e}", exc_info=True); return None
 
     def close_all_positions(self):
-        """
-        Close all tracked open positions using market orders.
-        Ensures the correct side and posSide are used for closing.
-        """
-        if not self.positions:
-            logger.info("No positions currently tracked by the bot to close.")
-            return
+        """ SUBMITS market order to close (One-Way, reduceOnly). Returns True/False on submission attempt. """
+        # Use self.total_contracts for size check now
+        if abs(self.total_contracts) < self.close_tolerance:
+            logger.info("close_all_positions called but total_contracts is near zero.")
+            # If contracts are zero, RoM state should already be reset by check_and_confirm_closure
+            return True # Nothing to close
 
-        logger.info(f"Attempting to close {len(self.positions)} tracked position entries.")
+        position_type_to_close = self.current_signal
+        if not position_type_to_close:
+            logger.error("Cannot close: current_signal is None but total_contracts is not zero!")
+            # Attempt to infer from contracts sign?
+            if self.total_contracts > 0: position_type_to_close = "buy"
+            elif self.total_contracts < 0: position_type_to_close = "sell" # Should not happen in one-way? Check OKX impl.
+            else: return False # Should be caught by initial check
+            logger.warning(f"Inferred position type '{position_type_to_close}' based on total_contracts sign.")
+            # Let's assume self.total_contracts always reflects the net position correctly in One-Way mode.
 
-        # Determine the type ('buy' or 'sell') and total size of positions to close
-        # Assuming all positions in self.positions are of the same type due to the run logic
-        if not self.current_signal:
-             logger.warning("Closing positions but current_signal is None. Determining type from positions list.")
-             if self.positions:
-                 position_type_to_close = self.positions[0]['type'] # Get type from first position in list
-             else:
-                 logger.error("Cannot determine position type to close.")
-                 return # Should not happen if self.positions is not empty
-        else:
-            position_type_to_close = self.current_signal
-
-        total_size_to_close = self.get_total_position_size(position_type_to_close)
+        # Ensure size is positive for the order amount
+        total_size_to_close = abs(self.total_contracts)
+        # Apply precision truncation to the closing size
+        total_size_to_close = self.truncate(total_size_to_close, self.amount_precision)
 
         if total_size_to_close <= 0:
-            logger.warning(f"Calculated total size to close for {position_type_to_close} is {total_size_to_close}. Clearing tracked positions without ordering.")
-            self.positions.clear()
-            self.current_signal = None
-            return
+            logger.warning(f"Calculated close size for {position_type_to_close} truncated to zero. Assuming closed.")
+            return True # Treat as success
+
+        logger.info(f"Attempting submission to close {position_type_to_close} position of size {total_size_to_close} (One-Way).")
 
         try:
-            # Fetch the latest price for logging purposes (optional)
-            # ticker = self.exchange.fetch_ticker(self.symbol)
-            # latest_price = ticker['last']
-
-            params = {'tdMode': 'cross'} # Match execution mode
+            params = {'tdMode': self.margin_mode, 'reduceOnly': True}
             close_order = None
+            close_side = None
 
-            if position_type_to_close == "buy":
-                # Close LONG positions by SELLING with posSide=long
-                params['posSide'] = 'long'
-                logger.info(f"Attempting to CLOSE LONG positions by creating MARKET SELL order: Symbol={self.symbol}, Amount={total_size_to_close}, Params={params}")
-                close_order = self.exchange.create_market_sell_order(
-                    symbol=self.symbol,
-                    amount=total_size_to_close,
-                    params=params
-                )
-                logger.info(f"Submitted market sell order to close LONG positions. Size: {total_size_to_close}. Order ID: {close_order['id']}")
+            if position_type_to_close == "buy": # Closing Long
+                close_side = "SELL"
+                close_order = self.exchange.create_market_sell_order(self.symbol, total_size_to_close, params)
+            elif position_type_to_close == "sell": # Closing Short
+                close_side = "BUY"
+                close_order = self.exchange.create_market_buy_order(self.symbol, total_size_to_close, params)
 
-            elif position_type_to_close == "sell":
-                # Close SHORT positions by BUYING with posSide=short
-                params['posSide'] = 'short'
-                logger.info(f"Attempting to CLOSE SHORT positions by creating MARKET BUY order: Symbol={self.symbol}, Amount={total_size_to_close}, Params={params}")
-                close_order = self.exchange.create_market_buy_order(
-                    symbol=self.symbol,
-                    amount=total_size_to_close,
-                    params=params
-                )
-                logger.info(f"Submitted market buy order to close SHORT positions. Size: {total_size_to_close}. Order ID: {close_order['id']}")
-
-            # Clear internal position tracking *after* successfully submitting close order
-            self.positions.clear()
-            self.current_signal = None
-            logger.info("Successfully submitted closing order(s) and cleared internal position tracking.")
-
+            if close_order and close_order.get('id'):
+                logger.info(f"Successfully SUBMITTED market {close_side} order (reduceOnly) ID: {close_order['id']}")
+                return True # Indicate submission success
+            else:
+                logger.error(f"Close order ({close_side}) submission failed. Response: {close_order}")
+                return False
         except ccxt.ExchangeError as e:
-            # Handle potential errors during closing (e.g., insufficient margin, position already closed)
-            logger.error(f"Exchange error closing {position_type_to_close} positions: {e}")
-            # Depending on error, might need manual intervention or retry logic
-            # For now, we log the error. Internal state might be inconsistent if order failed.
-            # Consider fetching actual positions from exchange to verify state if errors occur.
-        except Exception as e:
-            logger.error(f"Unexpected error closing {position_type_to_close} positions: {e}")
-            # Log error, internal state might be inconsistent.
+             if 'reduce-only' in str(e).lower() or 'position not found' in str(e).lower() or 'position is not existed' in str(e).lower() or 'size is zero' in str(e).lower():
+                  logger.warning(f"Closing order submission failed, likely position already closed/gone: {e}")
+                  return True # Return True as the goal (being flat) is likely achieved.
+             else: logger.error(f"Exchange error submitting closing ({close_side}) order: {e}"); return False
+        except Exception as e: logger.error(f"Unexpected error submitting closing order: {e}", exc_info=True); return False
+
+    def check_and_confirm_closure(self):
+        """ Fetches position and confirms if it's effectively closed. Resets RoM state if closed."""
+        logger.info("Checking position status for close confirmation...")
+        try:
+            position_info = self.exchange.fetch_position(self.symbol)
+            size = 0.0
+            # Prioritize 'contracts', then 'info'/'pos', handle None carefully
+            contracts_val = position_info.get('contracts')
+            info_pos_val = position_info.get('info', {}).get('pos')
+
+            if contracts_val is not None:
+                 try: size = float(contracts_val)
+                 except ValueError: logger.warning(f"Could not convert position 'contracts' {contracts_val} to float.")
+            elif info_pos_val is not None:
+                 try: size = float(info_pos_val)
+                 except ValueError: logger.warning(f"Could not convert position 'info.pos' {info_pos_val} to float.")
+            else: # Fallback or if position doesn't exist
+                 logger.info(f"Could not find definite size ('contracts' or 'info.pos'). Position likely closed.")
+                 size = 0.0 # Assume closed if no size info found
+
+            logger.info(f"Fetched position size: {size}. Close tolerance: {self.close_tolerance}")
+
+            if abs(size) <= self.close_tolerance:
+                logger.info("CONFIRMED: Position is closed (size within tolerance).")
+                self.waiting_for_close_confirmation = False
+                # --- Reset State ---
+                self.positions.clear() # Clear optional tracking list
+                self.current_signal = None
+                self.total_contracts = 0.0
+                self.sum_entry_value = 0.0
+                self.average_entry_price = 0.0
+                logger.info("Internal state (positions, RoM tracking) cleared.")
+                return True
+            else:
+                logger.info(f"Position still open (Size: {size}). Waiting for closure.")
+                # Update internal contract size based on fetch? Could cause issues if fetch is delayed. Let's not for now.
+                # self.total_contracts = size # Optional: Sync state with exchange
+                return False
+        except ccxt.ExchangeError as e:
+             if 'position does not exist' in str(e).lower() or 'no position' in str(e).lower():
+                   logger.info(f"Position fetch confirmed no position exists for {self.symbol}.")
+                   self.waiting_for_close_confirmation = False
+                   # --- Reset State ---
+                   self.positions.clear(); self.current_signal = None; self.total_contracts = 0.0; self.sum_entry_value = 0.0; self.average_entry_price = 0.0
+                   logger.info("Internal state cleared.")
+                   return True
+             else: logger.error(f"Exchange error fetching position for confirmation: {e}"); return False
+        except Exception as e: logger.error(f"Error checking/confirming closure: {e}", exc_info=True); return False
+
+    def check_tp_sl(self):
+        """ Checks TP/SL based on Return on Margin and triggers close if needed. Returns True if close was triggered. """
+        if abs(self.total_contracts) < self.close_tolerance or self.current_signal is None:
+            return False # No position or signal to check TP/SL for
+
+        try:
+            ticker = self.exchange.fetch_ticker(self.symbol)
+            # Prefer mark price for PnL in futures, fallback to last price
+            current_price = ticker.get('mark', ticker.get('last'))
+            if current_price is None:
+                logger.warning("Could not fetch current price (mark or last). Skipping TP/SL check.")
+                return False
+
+            # Ensure average_entry_price is calculated
+            if abs(self.total_contracts) > self.close_tolerance and self.average_entry_price == 0.0:
+                 self.average_entry_price = self.sum_entry_value / self.total_contracts
+                 logger.info(f"Recalculated average entry price: {self.average_entry_price}")
+
+            if self.average_entry_price == 0.0: # Should not happen if contracts > 0
+                 logger.error("Cannot calculate PnL: Average entry price is zero.")
+                 return False
+
+            # --- Calculate PnL ---
+            pnl = 0.0
+            if self.current_signal == 'buy':
+                pnl = (current_price - self.average_entry_price) * self.total_contracts
+            elif self.current_signal == 'sell':
+                 # For short, size is negative in some conventions, positive in others.
+                 # Assume self.total_contracts holds the correct signed size or calculate based on positive size.
+                 # Let's assume self.total_contracts is the correct net size (e.g. +10 for long, -10 for short) - Needs verification for OKX One-Way.
+                 # If OKX One-Way fetch_position returns positive size for short, need to adjust.
+                 # Assuming self.total_contracts is positive size here for calculation simplicity:
+                 pnl = (self.average_entry_price - current_price) * abs(self.total_contracts) # PnL for short
+
+            # --- Calculate Initial Margin ---
+            # Initial margin is based on the entry value sum, independent of current price
+            if self.leverage == 0: logger.error("Leverage is zero, cannot calculate RoM."); return False
+            total_initial_margin = abs(self.sum_entry_value / self.leverage) # Use absolute value
+
+            if total_initial_margin == 0:
+                logger.warning("Total initial margin is zero. Cannot calculate RoM.")
+                return False
+
+            # --- Calculate RoM ---
+            rom_percentage = (pnl / total_initial_margin) * 100.0
+
+            logger.info(f"TP/SL Check: Price={current_price:.5f}, AvgEntry={self.average_entry_price:.5f}, Size={self.total_contracts}, PnL={pnl:.4f}, Margin={total_initial_margin:.4f}, RoM={rom_percentage:.2f}%")
+
+            # --- Check Trigger ---
+            tp_triggered = rom_percentage >= self.tp_percentage
+            sl_triggered = rom_percentage <= -self.sl_percentage # SL is a negative RoM
+
+            if tp_triggered or sl_triggered:
+                reason = f"TP ({self.tp_percentage}%)" if tp_triggered else f"SL ({self.sl_percentage}%)"
+                logger.info(f"!!! {reason} Triggered !!! RoM: {rom_percentage:.2f}%. Attempting to close position.")
+                close_submitted = self.close_all_positions()
+                if close_submitted:
+                    self.waiting_for_close_confirmation = True
+                    logger.info(f"Close order submitted due to {reason}. Confirmation pending.")
+                else:
+                    logger.error(f"Failed to submit closing order for {reason}.")
+                return True # Indicate close was triggered this cycle
+
+            return False # No TP/SL triggered
+
+        except ccxt.NetworkError as e: logger.error(f"Network error fetching ticker for TP/SL: {e}"); return False
+        except Exception as e: logger.error(f"Error during TP/SL check: {e}", exc_info=True); return False
+
 
     def run(self):
-        """
-        Main trading loop:
-         - Fetches 15m and 1m data every minute.
-         - Determines 15m trend signal.
-         - Determines 1m confirmation/exit signals.
-         - Prioritizes Exit: Checks 1m exit condition (EMA10/30 cross) OR 15m signal reversal. Closes position if triggered.
-         - Strict Entry: Only enters if NO position exists AND 15m signal == 1m confirmation signal.
-         - Strict Scale-In: Only adds to position if position exists AND 15m signal == current position signal AND 15m signal == 1m confirmation signal.
-         - No trades executed under other conditions.
-        """
-        if self.running:
-            logger.warning("Bot is already running.")
-            return
-
+        """ Main trading loop with Close Confirmation and TP/SL """
+        if self.running: logger.warning("Bot already running."); return
         self.running = True
-        self.set_leverage() # Attempt to set leverage at start
-        logger.info(f"Bot started: Trading {self.symbol} on {self.entry_timeframe}/{self.exit_timeframe}")
+        self.set_leverage()
+        logger.info(f"Bot started: {self.symbol} | Leverage: {self.leverage}x | TP: {self.tp_percentage}% | SL: {self.sl_percentage}%")
 
         while self.running:
             try:
-                # --- 1. Fetch Data ---
-                df_15m = self.fetch_ohlcv(self.entry_timeframe, limit=100) # Need enough for EMA60
-                df_1m = self.fetch_ohlcv(self.exit_timeframe, limit=100)  # Need enough for EMA60
+                # === PRIORITY 1: Check and Confirm Closure ===
+                if self.waiting_for_close_confirmation:
+                    self.check_and_confirm_closure()
+                    logger.info(f"Cycle ended (waiting close confirmation). Sleeping {self.loop_sleep}s...")
+                    time.sleep(self.loop_sleep)
+                    continue
 
+                # === If not waiting for close, proceed ===
+                # --- 1. Fetch Data ---
+                df_15m = self.fetch_ohlcv(self.entry_timeframe, limit=100)
+                df_1m = self.fetch_ohlcv(self.exit_timeframe, limit=100)
                 if df_15m is None or df_1m is None:
-                    logger.warning("Failed to fetch data for one or both timeframes, sleeping before retry...")
-                    time.sleep(60)
+                    logger.warning(f"Data fetch failed, sleeping {self.loop_sleep}s...")
+                    time.sleep(self.loop_sleep)
                     continue
 
                 # --- 2. Generate Signals ---
-                entry_signal_15m = self.get_entry_signal_15m(df_15m)    # Primary trend: "buy", "sell", or None
-                confirm_signal_1m = self.get_confirmation_signal_1m(df_1m) # Confirmation: "buy", "sell", or None
+                entry_signal_15m = self.get_entry_signal_15m(df_15m)
+                confirm_signal_1m = self.get_confirmation_signal_1m(df_1m)
+                logger.info(f"Signals: 15m={entry_signal_15m}, 1mConfirm={confirm_signal_1m}, CurrentPos={self.current_signal}")
 
-                logger.info(f"Signals: 15m Entry={entry_signal_15m}, 1m Confirm={confirm_signal_1m}, Current Position Type={self.current_signal}")
+                # --- 3. Check Risk Management (TP/SL) if Position Active (PRIORITY 2) ---
+                tp_sl_close_triggered = False
+                if self.current_signal is not None: # Check only if we believe a position is open
+                     tp_sl_close_triggered = self.check_tp_sl()
 
-                # --- 3. Check Exit Conditions (PRIORITY) ---
-                exit_trigger_1m = False
-                reversal_trigger_15m = False
+                # --- 4. Check Strategy Exits (EMA/Reversal) if NOT closed by TP/SL (PRIORITY 3) ---
+                strategy_close_triggered = False
+                if not tp_sl_close_triggered and self.current_signal is not None:
+                    exit_trigger_1m = self.get_exit_signal_1m(df_1m, self.current_signal)
+                    reversal_trigger_15m = (entry_signal_15m is not None and entry_signal_15m != self.current_signal)
+                    if reversal_trigger_15m: logger.info(f"Reversal Trigger: 15m ({entry_signal_15m}) differs from current ({self.current_signal}).")
 
-                if self.positions: # Only check exit/reversal if we have open positions
-                    current_pos_type = self.current_signal # Should match the type of positions in self.positions
-                    if not current_pos_type:
-                         logger.error("Positions exist but current_signal is None. Cannot check exit/reversal accurately.")
-                         # This indicates a state inconsistency, potentially close positions to be safe
-                         # self.close_all_positions() # Optional safety measure
-                         # time.sleep(60)
-                         # continue
-                    else:
-                        # Check 1: 1m EMA10/30 cross exit signal
-                        exit_trigger_1m = self.get_exit_signal_1m(df_1m, current_pos_type)
-
-                        # Check 2: 15m signal reverses against the current position
-                        if entry_signal_15m is not None and entry_signal_15m != current_pos_type:
-                            reversal_trigger_15m = True
-                            logger.info(f"Reversal Trigger: 15m signal ({entry_signal_15m}) reversed against current position ({current_pos_type}).")
-
-                # --- 4. Execute Actions: Close or Enter/Scale ---
-                # ACTION: Close if exit or reversal triggered
-                if exit_trigger_1m or reversal_trigger_15m:
-                    reason = "1m EMA10/30 exit signal" if exit_trigger_1m else "15m signal reversal"
-                    logger.info(f"Exit condition met ({reason}). Closing all positions for {self.symbol}.")
-                    self.close_all_positions()
-                    # After closing, wait for the next cycle to potentially enter a new position
-
-                # ACTION: Enter or Scale In (Only if no exit/reversal occurred)
-                else:
-                    # Condition for NEW ENTRY: No positions AND 15m signal aligns with 1m confirmation
-                    if not self.positions:
-                        if entry_signal_15m is not None and entry_signal_15m == confirm_signal_1m:
-                            logger.info(f"ENTRY condition met: 15m ({entry_signal_15m}) and 1m ({confirm_signal_1m}) signals align. No open positions.")
-                            self.execute_trade(entry_signal_15m, df_1m['close'].iloc[-1])
-                            if self.positions: # Check if trade execution was successful and added position
-                                self.current_signal = entry_signal_15m # Set current signal only after successful entry
+                    if exit_trigger_1m or reversal_trigger_15m:
+                        reason = "1m Exit Crossover" if exit_trigger_1m else "15m Signal Reversal"
+                        logger.info(f"Strategy Exit Condition Met ({reason}). Attempting close.")
+                        close_submitted = self.close_all_positions()
+                        if close_submitted:
+                            self.waiting_for_close_confirmation = True
+                            logger.info("Strategy close order submitted. Confirmation pending.")
+                            strategy_close_triggered = True
                         else:
-                            logger.info(f"Holding: No open positions, but entry conditions not met (15m: {entry_signal_15m}, 1m: {confirm_signal_1m}).")
+                            logger.error("Failed to submit strategy closing order.")
 
-                    # Condition for SCALING IN: Positions exist AND 15m signal matches current position AND 15m signal aligns with 1m confirmation
-                    elif self.positions and entry_signal_15m is not None and entry_signal_15m == self.current_signal and entry_signal_15m == confirm_signal_1m:
-                         logger.info(f"SCALING IN condition met: Signal ({entry_signal_15m}) remains valid and confirmed on 1m.")
-                         self.execute_trade(entry_signal_15m, df_1m['close'].iloc[-1])
-                    # Condition: HOLDING existing position
-                    elif self.positions:
-                        logger.info(f"Holding: Existing {self.current_signal} position. Conditions for scaling ({entry_signal_15m} == {self.current_signal} == {confirm_signal_1m}) not met.")
-                    # Condition: No signal or mismatch while flat
-                    else: # Should technically be covered by the 'No positions' block above
-                         logger.info("Holding: No positions and no valid entry signal.")
+                # --- 5. Execute Entry/Scale Actions (Only if NO close was triggered this cycle) ---
+                if not tp_sl_close_triggered and not strategy_close_triggered:
+                    # ENTRY Condition
+                    if self.current_signal is None: # Check using current_signal now
+                        if entry_signal_15m is not None and entry_signal_15m == confirm_signal_1m:
+                            logger.info(f"ENTRY: Signals align ({entry_signal_15m}).")
+                            trade_result = self.execute_trade(entry_signal_15m, df_1m['close'].iloc[-1])
+                            if trade_result: self.current_signal = entry_signal_15m # Set signal after trade
+                        else:
+                            logger.info(f"Holding FLAT: Entry conditions not met.")
+                    # SCALE IN Condition
+                    elif entry_signal_15m == self.current_signal and confirm_signal_1m == self.current_signal:
+                         logger.info(f"SCALING IN: Signal ({self.current_signal}) valid & confirmed.")
+                         self.execute_trade(self.current_signal, df_1m['close'].iloc[-1])
+                    # HOLDING Condition
+                    else:
+                        logger.info(f"Holding {self.current_signal.upper()} position: Conditions not met for exit or scale.")
 
+                # --- 6. Wait ---
+                logger.info(f"Cycle complete. Sleeping {self.loop_sleep}s...")
+                time.sleep(self.loop_sleep)
 
-                # --- 5. Wait for Next Cycle ---
-                logger.info("Cycle complete. Waiting 60 seconds...")
-                time.sleep(60)
-
-            except KeyboardInterrupt:
-                logger.info("Keyboard interrupt received in main loop. Stopping bot.")
-                self.stop() # Gracefully stop and close positions
-                break # Exit the while loop
-            except ccxt.NetworkError as e:
-                 logger.error(f"Network error in main loop: {e}. Retrying after sleep.")
-                 time.sleep(60) # Wait longer after network errors
-            except ccxt.ExchangeNotAvailable as e:
-                 logger.error(f"Exchange not available: {e}. Retrying after longer sleep.")
-                 time.sleep(120)
-            except Exception as e:
-                logger.error(f"Unhandled error in main loop: {e}", exc_info=True) # Log traceback
-                # Potentially stop the bot on unhandled errors to prevent unexpected behaviour
-                # self.stop()
-                # break
-                logger.info("Attempting to continue after error. Sleeping for 60 seconds.")
-                time.sleep(60) # Wait before retrying after a generic error
+            except KeyboardInterrupt: logger.info("Keyboard interrupt. Stopping."); self.stop(); break
+            except ccxt.NetworkError as e: logger.error(f"Network error: {e}. Retrying after {self.loop_sleep}s."); time.sleep(self.loop_sleep)
+            except ccxt.ExchangeNotAvailable as e: logger.error(f"Exchange unavailable: {e}. Retrying after {self.loop_sleep*2}s."); time.sleep(self.loop_sleep*2)
+            except Exception as e: logger.error(f"Unhandled error in main loop: {e}", exc_info=True); time.sleep(self.loop_sleep)
 
         logger.info("Bot run loop finished.")
 
-
     def stop(self):
-        """
-        Stops the bot's main loop and attempts to close all open positions.
-        """
-        logger.info("Initiating bot stop sequence...")
-        self.running = False # Signal the main loop to terminate
-        logger.info("Closing all open positions...")
-        self.close_all_positions() # Attempt to close any remaining positions
+        """ Stops the bot and attempts final close """
+        logger.info("Initiating stop sequence...")
+        self.running = False
+        logger.info("Attempting final position close (if applicable)...")
+        if not self.waiting_for_close_confirmation and abs(self.total_contracts) > self.close_tolerance:
+             close_submitted = self.close_all_positions()
+             if close_submitted: logger.info("Final close order submitted (confirmation won't be checked).")
+             else: logger.error("Failed to submit final closing order.")
+        elif self.waiting_for_close_confirmation: logger.info("Bot was waiting close confirmation. Checking one last time."); self.check_and_confirm_closure()
+        else: logger.info("No active position or not waiting for close.")
         logger.info("Bot stopped.")
 
 # ----------------- Main Execution -----------------
 if __name__ == "__main__":
-    # Set sandbox_mode=False for LIVE TRADING with real funds!
-    # Ensure the API key used corresponds to the selected mode (sandbox or live).
-    is_sandbox = True # <<< SET TO False FOR LIVE TRADING >>>
-    
-    bot = None # Initialize bot variable
+    logger.info(f"Starting bot in {'SANDBOX' if BOT_CONFIG['sandbox_mode'] else 'LIVE'} mode.")
+    logger.info(f"Trade Symbol: {BOT_CONFIG['symbol']}, Leverage: {BOT_CONFIG['leverage']}x")
+    logger.info(f"TP: {BOT_CONFIG['tp_percentage']}% RoM, SL: {BOT_CONFIG['sl_percentage']}% RoM")
+    logger.info(f"Ensure OKX account is ONE-WAY position mode & {BOT_CONFIG['margin_mode'].upper()} margin for this symbol.")
+
+    bot = None
     try:
-        bot = DualTFTradingBot(sandbox_mode=is_sandbox)
+        bot = DualTFTradingBot(BOT_CONFIG)
         bot.run()
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received during startup/run. Stopping bot.")
-        if bot:
-            bot.stop()
-    except ccxt.AuthenticationError:
-         logger.error("Stopping bot due to authentication failure during initialization.")
-         # No need to call bot.stop() as initialization failed
-    except Exception as e:
-        logger.error(f"Critical unexpected error: {e}", exc_info=True)
-        if bot:
-            logger.info("Attempting emergency stop...")
-            bot.stop() # Attempt to stop and close positions even on critical error
-    finally:
-        logger.info("Bot execution finished.")
+    except KeyboardInterrupt: logger.info("Keyboard interrupt received."); bot.stop() if bot else None
+    except ccxt.AuthenticationError: logger.error("STOPPING: Authentication failed.") # Handled in init now
+    except Exception as e: logger.error(f"Critical unexpected error: {e}", exc_info=True); bot.stop() if bot else None
+    finally: logger.info("Bot execution finished.")
