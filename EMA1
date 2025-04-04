@@ -18,8 +18,8 @@ BOT_CONFIG = {
 
     # == Trading Strategy ==
     'symbol': "DOGE/USDT:USDT",
-    'leverage': 50,
-    'contract_size': 0.01,     # Size for each scaling-in order
+    'leverage': 49,
+    'contract_size': 0.1,     # Size for each scaling-in order
     'entry_timeframe': "15m",  # For EMA 30/60 signal
     'exit_timeframe': "1m",    # For EMA 30/60 confirmation & EMA 10/30 exit
 
@@ -28,7 +28,7 @@ BOT_CONFIG = {
     'sl_percentage': 10.0,  # Stop Loss % Return on Margin (RoM)
 
     # == Bot Internals ==
-    'margin_mode': 'cross', # MUST match account setting
+    'margin_mode': 'isolated', # MUST match account setting
     'close_tolerance_factor': 0.1, # e.g., 0.1 = 10% of contract size
     'loop_sleep_seconds': 60
 }
